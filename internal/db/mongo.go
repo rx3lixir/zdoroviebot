@@ -2,8 +2,8 @@ package db
 
 import (
 	"context"
+	"time"
 
-	"github.com/charmbracelet/log"
 	"github.com/rx3lixir/zdoroviebot/internal/models"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -11,126 +11,140 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-type RecipeRepo struct {
+// RecipeRepository определяет интерфейс для работы с рецептами
+type RecipeRepository interface {
+	GetAllRecipes(ctx context.Context) ([]models.Recipe, error)
+	GetRecipeByID(ctx context.Context, id primitive.ObjectID) (*models.Recipe, error)
+	GetAllBaseIngredients(ctx context.Context) ([]string, error)
+	FindRecipesByIngredients(ctx context.Context, ingredients []string) ([]models.Recipe, error)
+}
+
+// MongoRecipeRepo имплементирует интерфейс RecipeRepository
+type MongoRecipeRepo struct {
 	collection *mongo.Collection
 }
 
-func NewRecipeRepo(client *mongo.Client, dbname, collectionName string) *RecipeRepo {
-	return &RecipeRepo{
+// NewMongoRecipeRepo создает новый репозиторий рецептов
+func NewMongoRecipeRepo(client *mongo.Client, dbname, collectionName string) *MongoRecipeRepo {
+	return &MongoRecipeRepo{
 		collection: client.Database(dbname).Collection(collectionName),
 	}
 }
 
-func ConnectMongo(uri string, logger *log.Logger) (*mongo.Client, error) {
-	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri))
+// ConnectMongo устанавливает соединение с MongoDB
+func ConnectMongo(ctx context.Context, uri string) (*mongo.Client, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
 	if err != nil {
-		logger.Error("Unable to establish connection to MongoDB client")
 		return nil, err
 	}
 
-	if err = client.Ping(context.TODO(), nil); err != nil {
-		logger.Error("Mongo client is not responding")
+	if err = client.Ping(ctx, nil); err != nil {
 		return nil, err
 	}
-
-	logger.Info("Successfully connected to MondoDB")
 
 	return client, nil
 }
 
-func (r *RecipeRepo) GetAllRecipes(logger *log.Logger) ([]models.Recipe, error) {
-	logger.Info("Запрос к MongoDB...")
+// DisconnectMongo закрывает соединение с MongoDB
+func DisconnectMongo(ctx context.Context, client *mongo.Client) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	return client.Disconnect(ctx)
+}
+
+// GetAllRecipes возвращает все рецепты из базы данных
+func (r *MongoRecipeRepo) GetAllRecipes(ctx context.Context) ([]models.Recipe, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 
 	var recipes []models.Recipe
 
-	logger.Info("Запрос к MongoDB в коллекции:", r.collection.Name())
-
-	cursor, err := r.collection.Find(context.TODO(), bson.M{})
+	cursor, err := r.collection.Find(ctx, bson.M{})
 	if err != nil {
-		logger.Error("Ошибка запроса:", err)
 		return nil, err
 	}
-	defer cursor.Close(context.TODO())
+	defer cursor.Close(ctx)
 
-	if err = cursor.All(context.TODO(), &recipes); err != nil {
-		logger.Error("Ошибка десериализации:", err)
+	if err = cursor.All(ctx, &recipes); err != nil {
 		return nil, err
 	}
 
-	logger.Info("Получено рецептов:", len(recipes))
 	return recipes, nil
 }
 
-func (r *RecipeRepo) GetRecipeByID(id primitive.ObjectID, logger *log.Logger) (*models.Recipe, error) {
+// GetRecipeByID возвращает рецепт по его ID
+func (r *MongoRecipeRepo) GetRecipeByID(ctx context.Context, id primitive.ObjectID) (*models.Recipe, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	var recipe models.Recipe
 
-	err := r.collection.FindOne(context.TODO(), bson.M{"_id": id}).Decode(&recipe)
+	err := r.collection.FindOne(ctx, bson.M{"_id": id}).Decode(&recipe)
 	if err != nil {
-		logger.Error("Ошибка запроса рецепта по ID", id)
 		return nil, err
 	}
 
 	return &recipe, nil
 }
 
-// Получение всех базовых ингредиентов
-func (r *RecipeRepo) GetAllBaseIngredients(logger *log.Logger) ([]string, error) {
-	var results []struct {
-		BaseIngredients []string `bson:"base_ingredients"`
+// GetAllBaseIngredients возвращает все уникальные базовые ингредиенты
+func (r *MongoRecipeRepo) GetAllBaseIngredients(ctx context.Context) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	// Агрегация для получения уникальных ингредиентов
+	pipeline := []bson.M{
+		{"$unwind": "$base_ingredients"},
+		{"$group": bson.M{"_id": "$base_ingredients"}},
+		{"$sort": bson.M{"_id": 1}},
 	}
 
-	cursor, err := r.collection.Find(context.TODO(), bson.M{})
+	cursor, err := r.collection.Aggregate(ctx, pipeline)
 	if err != nil {
-		logger.Error("Ошибка получения списка ингредиентов", err)
 		return nil, err
 	}
-	defer cursor.Close(context.TODO())
+	defer cursor.Close(ctx)
 
-	for cursor.Next(context.TODO()) {
-		var res struct {
-			BaseIngredients []string `bson:"base_ingredients"`
-		}
-		if err := cursor.Decode(&res); err != nil {
-			continue
-		}
-		results = append(results, res)
+	var results []struct {
+		ID string `bson:"_id"`
 	}
 
-	// Собираем уникальные ингредиенты
-	uniqueIngredients := make(map[string]struct{})
-	for _, entry := range results {
-		for _, ing := range entry.BaseIngredients {
-			uniqueIngredients[ing] = struct{}{}
-		}
+	if err := cursor.All(ctx, &results); err != nil {
+		return nil, err
 	}
 
-	var ingredientList []string
-	for ing := range uniqueIngredients {
-		ingredientList = append(ingredientList, ing)
+	// Преобразуем результаты в срез строк
+	ingredients := make([]string, 0, len(results))
+	for _, r := range results {
+		ingredients = append(ingredients, r.ID)
 	}
 
-	return ingredientList, nil
+	return ingredients, nil
 }
 
-// Поиск рецептов по ингредиентам
-func (r *RecipeRepo) FindRecipesByIngredients(ingredients []string, logger *log.Logger) ([]models.Recipe, error) {
+// FindRecipesByIngredients ищет рецепты, содержащие все указанные ингредиенты
+func (r *MongoRecipeRepo) FindRecipesByIngredients(ctx context.Context, ingredients []string) ([]models.Recipe, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	var recipes []models.Recipe
 
-	filter := bson.M{"base_ingredients": bson.M{"$all": ingredients}} // Рецепты, содержащие все указанные ингредиенты
+	filter := bson.M{"base_ingredients": bson.M{"$all": ingredients}}
 
-	cursor, err := r.collection.Find(context.TODO(), filter)
+	cursor, err := r.collection.Find(ctx, filter)
 	if err != nil {
-		logger.Error("Ошибка поиска рецептов", err)
 		return nil, err
 	}
-	defer cursor.Close(context.TODO())
+	defer cursor.Close(ctx)
 
-	for cursor.Next(context.TODO()) {
-		var recipe models.Recipe
-		if err := cursor.Decode(&recipe); err == nil {
-			recipes = append(recipes, recipe)
-		}
+	if err = cursor.All(ctx, &recipes); err != nil {
+		return nil, err
 	}
 
 	return recipes, nil
 }
+
