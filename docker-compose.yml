@@ -1,0 +1,12 @@
+# mongo-db storage for bot zdorovie altai
+version: '3.3'
+services:
+  mongo:
+    ports:
+      - '27017:27017'
+    container_name: zdorovie-mongo
+    restart: always
+    logging:
+      options:
+        max-size: 1g
+    image: mongo
