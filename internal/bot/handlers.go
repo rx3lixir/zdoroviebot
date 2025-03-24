@@ -12,6 +12,13 @@ import (
 	"gopkg.in/telebot.v3"
 )
 
+// Константы для префиксов callback-данных
+const (
+	recipePrefix     = "recipe_"
+	ingredientPrefix = "ingr_"
+	searchPrefix     = "search_"
+)
+
 // BotHandler обрабатывает команды для телеграм-бота
 type BotHandler struct {
 	bot        *telebot.Bot
@@ -30,10 +37,15 @@ func NewBotHandler(bot *telebot.Bot, repo db.RecipeRepository, logger *log.Logge
 	}
 }
 
+// Храним выбранные ингредиенты для каждого пользователя
+// В реальном приложении лучше использовать Redis или другое хранилище
+var userIngredients = make(map[int64]map[string]bool)
+
 // RegisterHandlers регистрирует все обработчики команд
 func (h *BotHandler) RegisterHandlers() {
 	h.bot.Handle("/start", h.handleStart)
 	h.bot.Handle("/recipes", h.handleRecipes)
+	h.bot.Handle("/ingredients", h.handleIngredients) // Новый обработчик
 	h.bot.Handle(telebot.OnCallback, h.handleCallback)
 }
 
@@ -68,37 +80,164 @@ func (h *BotHandler) handleRecipes(c telebot.Context) error {
 func (h *BotHandler) handleCallback(c telebot.Context) error {
 	ctx := context.Background()
 	data := c.Callback().Data
+	userID := c.Sender().ID
 
-	// Используем константы для префиксов
-	const recipePrefix = "recipe_"
+	// -- ОБРАБОТКА ВЫБОРА ИНГРИДИЕНТОВ -- \\
+	if strings.HasPrefix(data, ingredientPrefix) {
+		ingredient := strings.TrimPrefix(data, ingredientPrefix)
 
-	if !strings.HasPrefix(data, recipePrefix) {
-		h.logger.Warn("unknown callback data", "data", data)
-		return c.Respond()
+		// Переключаем состояние выбора ингридиента
+		if userIngredients[userID] == nil {
+			userIngredients[userID] = make(map[string]bool)
+		}
+
+		userIngredients[userID][ingredient] = !userIngredients[userID][ingredient]
+
+		// Получаем все ингридиенты для обновления клавиатуры
+		ingredients, err := h.repo.GetAllBaseIngredients(ctx)
+		if err != nil {
+			h.logger.Error("Failed to get all base ingredients", "error", err)
+			return c.Respond()
+		}
+
+		markup := h.createIngredientsKeyboard(ingredients, userID)
+		return c.Edit("Выберите ингридиенты, которые у вас есть", markup)
 	}
 
-	recipeID := strings.TrimPrefix(data, recipePrefix)
+	// -- ОБРАБОТКА ПО ВЫБРАННЫМ ИГРИДИЕНТАМ -- \\
+	if strings.HasPrefix(data, searchPrefix) {
 
-	objID, err := primitive.ObjectIDFromHex(recipeID)
+		// Собираемм выбранные ингридиенты
+		var selectedIngredients []string
+
+		for ingredient, selected := range userIngredients[userID] {
+			if selected {
+				selectedIngredients = append(selectedIngredients, ingredient)
+			}
+		}
+
+		if len(selectedIngredients) == 0 {
+			return c.Respond(&telebot.CallbackResponse{
+				Text:      "Выберите хотя бы один ингридиент",
+				ShowAlert: true,
+			})
+		}
+
+		recipes, err := h.repo.FindRecipesByIngredients(ctx, selectedIngredients)
+		if err != nil {
+			h.logger.Error("Failed to find recipes by ingredients", "error", err)
+			return c.Respond(&telebot.CallbackResponse{
+				Text:      "Ошибка при поиске рецептов",
+				ShowAlert: true,
+			})
+		}
+
+		if len(recipes) == 0 {
+			return c.Edit(fmt.Sprintf("К сожалению, рецептов с ингридиентами %s не найдено.", strings.Join(selectedIngredients, ", ")))
+		}
+
+		// Показываем найденные рецепты
+		resultMessage := fmt.Sprintf("Найдено %d рецептов с ингридиентами: \n%s",
+			len(recipes),
+			strings.Join(selectedIngredients, ", "))
+
+		markup := h.createRecipesKeyboard(recipes)
+		return c.Edit(resultMessage, markup)
+	}
+
+	// -- Обработка для рецептов-- \\
+	if strings.HasPrefix(data, recipePrefix) {
+
+		recipeID := strings.TrimPrefix(data, recipePrefix)
+
+		objID, err := primitive.ObjectIDFromHex(recipeID)
+		if err != nil {
+			h.logger.Error("invalid recipe ID format", "id", recipeID, "error", err)
+			return c.Respond(&telebot.CallbackResponse{
+				Text:      "⚠️ Неверный формат ID рецепта",
+				ShowAlert: true,
+			})
+		}
+
+		recipe, err := h.repo.GetRecipeByID(ctx, objID)
+		if err != nil {
+			h.logger.Error("failed to get recipe by ID", "id", recipeID, "error", err)
+			return c.Respond(&telebot.CallbackResponse{
+				Text:      "⚠️ Рецепт не найден",
+				ShowAlert: true,
+			})
+		}
+
+		detailsMsg := h.msgBuilder.BuildRecipeDetails(recipe)
+		return c.Edit(detailsMsg, telebot.ModeMarkdown)
+	}
+
+	h.logger.Warn("Unknown callback data", "data", data)
+	return c.Respond()
+}
+
+func (h *BotHandler) handleIngredients(c telebot.Context) error {
+	ctx := context.Background()
+
+	ingredients, err := h.repo.GetAllBaseIngredients(ctx)
 	if err != nil {
-		h.logger.Error("invalid recipe ID format", "id", recipeID, "error", err)
-		return c.Respond(&telebot.CallbackResponse{
-			Text:      "⚠️ Неверный формат ID рецепта",
-			ShowAlert: true,
-		})
+		h.logger.Error("Failed to get base ingredients", "error", err)
+		return c.Send("Не удалось получить список ингредиентов. Попробуйте позже.")
 	}
 
-	recipe, err := h.repo.GetRecipeByID(ctx, objID)
-	if err != nil {
-		h.logger.Error("failed to get recipe by ID", "id", recipeID, "error", err)
-		return c.Respond(&telebot.CallbackResponse{
-			Text:      "⚠️ Рецепт не найден",
-			ShowAlert: true,
-		})
+	if len(ingredients) == 0 {
+		return c.Send("Ингридиентов пока нет. Загляните позже!")
 	}
 
-	detailsMsg := h.msgBuilder.BuildRecipeDetails(recipe)
-	return c.Edit(detailsMsg, telebot.ModeMarkdown)
+	// Инициализация карты выбарнных ингридиентов для пользователя (костыль пиздец)
+	userID := c.Sender().ID
+	userIngredients[userID] = make(map[string]bool)
+
+	markup := h.createIngredientsKeyboard(ingredients, userID)
+	return c.Send("Выберите ингридиенты, которые у вас есть:", markup)
+}
+
+func (h *BotHandler) createIngredientsKeyboard(ingredients []string, userID int64) *telebot.ReplyMarkup {
+	markup := &telebot.ReplyMarkup{}
+
+	// Две кнопки в ряд
+	const buttonsPerRow = 2
+	var currentRow []telebot.InlineButton
+
+	// Создаем кнопки для каждого ингридиента
+	for i, ingredient := range ingredients {
+		selected := userIngredients[userID][ingredient]
+
+		// Галка для выбранных ингридиентов
+		buttonText := ingredient
+		if selected {
+			buttonText = "✅ " + ingredient
+		}
+
+		button := telebot.InlineButton{
+			Text: buttonText,
+			Data: fmt.Sprintf("%s%s", ingredientPrefix, ingredient),
+		}
+
+		currentRow = append(currentRow, button)
+
+		// Если ряд заполнен или это последний ингридиент, добавляем ряд в клавиатуру
+		if len(currentRow) == buttonsPerRow || i == len(ingredients)-1 {
+			markup.InlineKeyboard = append(markup.InlineKeyboard, currentRow)
+			currentRow = []telebot.InlineButton{}
+		}
+
+	}
+	searchButton := telebot.InlineButton{
+		Text: "🔍 Найти рецепты",
+		Data: fmt.Sprintf("%s%d", searchPrefix, userID),
+	}
+
+	// Отдельный ряд только для кнопки поиска рецептов
+	searchRow := []telebot.InlineButton{searchButton}
+	markup.InlineKeyboard = append(markup.InlineKeyboard, searchRow)
+
+	return markup
 }
 
 // createRecipesKeyboard создает инлайн-клавиатуру с рецептами
@@ -138,8 +277,7 @@ func NewMessageBuilder() *MessageBuilder {
 func (mb *MessageBuilder) BuildRecipeDetails(recipe *models.Recipe) string {
 	return fmt.Sprintf(
 		"*%s*\n\n"+
-			"🍽 *Ингредиенты*:\n%s\n\n"+
-			"🧂 *Дополнительные ингредиенты*:\n%s\n\n"+
+			"🧂 *Ингридиенты:*\n%s, %s\n\n"+
 			"🔥 *Способ приготовления*:\n%s\n\n"+
 			"⚡ *Пищевая ценность*:\n"+
 			"Калории: %d ккал\n"+
@@ -147,8 +285,8 @@ func (mb *MessageBuilder) BuildRecipeDetails(recipe *models.Recipe) string {
 			"Жиры: %.1f г\n"+
 			"Углеводы: %.1f г",
 		recipe.Name,
-		strings.Join(recipe.BaseIngredients, ", "),
 		strings.Join(recipe.ExtraIngredients, ", "),
+		strings.Join(recipe.BaseIngredients, ", "),
 		recipe.Procedure,
 		recipe.Nutrition.Calories,
 		recipe.Nutrition.Proteins,
